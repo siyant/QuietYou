@@ -17,6 +17,9 @@
 @property (strong) NSMutableArray<NSString *> *ignoreStrings;
 @end
 
+static NSString * const QuietYouLegacyLaunchAgentLabel = @"net.briankendall.QuietYouAgent";
+static NSString * const QuietYouLegacyLaunchAgentFilename = @"net.briankendall.QuietYou.agent.plist";
+
 @implementation ViewController {
     SMAppService *agentService;
     NSUserDefaults *appDefaults;
@@ -30,8 +33,7 @@
     placeholderLabel = nil;
     
     agentService = [SMAppService agentServiceWithPlistName:@"net.briankendall.QuietYou.agent.plist"];
-    self.enableCheckbox.state =
-        (agentService.status == SMAppServiceStatusEnabled) ? NSControlStateValueOn : NSControlStateValueOff;
+    self.enableCheckbox.state = [self isAgentEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
     
     appDefaults = [[NSUserDefaults alloc] initWithSuiteName:@"net.briankendall.QuietYou.shared"];
     NSArray *inIgnoreStrings = [appDefaults objectForKey:@"ignoreStrings"];
@@ -62,13 +64,25 @@
         if (success) {
             return;
         }
+
+        if ([self shouldUseLegacyLaunchAgentFallbackForError:error]) {
+            NSError *legacyError = nil;
+
+            if ([self installLegacyLaunchAgent:&legacyError]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.enableCheckbox.state = NSControlStateValueOn;
+                });
+
+                return;
+            }
+
+            error = legacyError ?: error;
+        }
         
         NSLog(@"startAgent error: %@", error.description);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.enableCheckbox.state = (self->agentService.status == SMAppServiceStatusEnabled)
-                                            ? NSControlStateValueOn
-                                            : NSControlStateValueOff;
+            self.enableCheckbox.state = [self isAgentEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
             [self displayError:NSLocalizedString(@"Failed to start the QuietYou background agent!", @"") error:error];
         });
     });
@@ -82,16 +96,150 @@
         if (success) {
             return;
         }
+
+        if ([self shouldUseLegacyLaunchAgentFallbackForError:error] || [self isLegacyLaunchAgentInstalled]) {
+            NSError *legacyError = nil;
+
+            if ([self removeLegacyLaunchAgent:&legacyError]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.enableCheckbox.state = NSControlStateValueOff;
+                });
+
+                return;
+            }
+
+            error = legacyError ?: error;
+        }
         
         NSLog(@"stopAgent error: %@", error.description);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.enableCheckbox.state = (self->agentService.status == SMAppServiceStatusEnabled)
-                                            ? NSControlStateValueOn
-                                            : NSControlStateValueOff;
+            self.enableCheckbox.state = [self isAgentEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
             [self displayError:NSLocalizedString(@"Failed to stop the QuietYou background agent!", @"") error:error];
         });
     });
+}
+
+- (BOOL)isAgentEnabled {
+    return (agentService.status == SMAppServiceStatusEnabled) || [self isLegacyLaunchAgentInstalled];
+}
+
+- (BOOL)isLegacyLaunchAgentInstalled {
+    return [[NSFileManager defaultManager] fileExistsAtPath:[self legacyLaunchAgentPlistURL].path];
+}
+
+- (BOOL)shouldUseLegacyLaunchAgentFallbackForError:(NSError *)error {
+    if (!error) {
+        return NO;
+    }
+
+    if (error.code == -67056) {
+        return YES;
+    }
+
+    return [error.localizedDescription localizedCaseInsensitiveContainsString:@"codesigning failure"];
+}
+
+- (NSURL *)legacyLaunchAgentPlistURL {
+    NSURL *launchAgentsDirectory =
+        [[[NSFileManager defaultManager] homeDirectoryForCurrentUser] URLByAppendingPathComponent:@"Library/LaunchAgents"
+                                                                                     isDirectory:YES];
+    return [launchAgentsDirectory URLByAppendingPathComponent:QuietYouLegacyLaunchAgentFilename];
+}
+
+- (NSURL *)embeddedAgentExecutableURL {
+    return [[NSBundle mainBundle].bundleURL URLByAppendingPathComponent:@"Contents/MacOS/QuietYouAgent.app/Contents/MacOS/QuietYouAgent"];
+}
+
+- (BOOL)runLaunchctlArguments:(NSArray<NSString *> *)arguments error:(NSError **)error {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/launchctl";
+    task.arguments = arguments;
+
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardError = stderrPipe;
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"QuietYouLegacyLaunchAgent"
+                                         code:1
+                                     userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"launchctl failed to start"}];
+        }
+
+        return NO;
+    }
+
+    if (task.terminationStatus == 0) {
+        return YES;
+    }
+
+    NSData *stderrData = [[stderrPipe fileHandleForReading] readDataToEndOfFile];
+    NSString *stderrString = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
+
+    if (error) {
+        *error = [NSError errorWithDomain:@"QuietYouLegacyLaunchAgent"
+                                     code:task.terminationStatus
+                                 userInfo:@{NSLocalizedDescriptionKey: stderrString.length > 0 ? stderrString : @"launchctl failed"}];
+    }
+
+    return NO;
+}
+
+- (BOOL)installLegacyLaunchAgent:(NSError **)error {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSURL *launchAgentURL = [self legacyLaunchAgentPlistURL];
+    NSURL *launchAgentsDirectory = [launchAgentURL URLByDeletingLastPathComponent];
+
+    if (![fileManager createDirectoryAtURL:launchAgentsDirectory
+               withIntermediateDirectories:YES
+                                attributes:nil
+                                     error:error]) {
+        return NO;
+    }
+
+    NSDictionary *launchAgent = @{
+        @"Label": QuietYouLegacyLaunchAgentLabel,
+        @"ProgramArguments": @[[self embeddedAgentExecutableURL].path],
+        @"RunAtLoad": @YES,
+        @"KeepAlive": @YES,
+        @"ProcessType": @"Interactive",
+    };
+
+    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:launchAgent
+                                                                   format:NSPropertyListXMLFormat_v1_0
+                                                                  options:0
+                                                                    error:error];
+
+    if (!plistData) {
+        return NO;
+    }
+
+    if (![plistData writeToURL:launchAgentURL options:NSDataWritingAtomic error:error]) {
+        return NO;
+    }
+
+    NSString *domainTarget = [NSString stringWithFormat:@"gui/%u", getuid()];
+    NSError *bootoutError = nil;
+    [self runLaunchctlArguments:@[@"bootout", domainTarget, launchAgentURL.path] error:&bootoutError];
+
+    return [self runLaunchctlArguments:@[@"bootstrap", domainTarget, launchAgentURL.path] error:error];
+}
+
+- (BOOL)removeLegacyLaunchAgent:(NSError **)error {
+    NSURL *launchAgentURL = [self legacyLaunchAgentPlistURL];
+    NSString *domainTarget = [NSString stringWithFormat:@"gui/%u", getuid()];
+    NSError *bootoutError = nil;
+    [self runLaunchctlArguments:@[@"bootout", domainTarget, launchAgentURL.path] error:&bootoutError];
+
+    if ([[NSFileManager defaultManager] fileExistsAtPath:launchAgentURL.path] &&
+        ![[NSFileManager defaultManager] removeItemAtURL:launchAgentURL error:error]) {
+        return NO;
+    }
+
+    return YES;
 }
 
 - (void)displayError:(NSString *)message error:(NSError *)error {
