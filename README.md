@@ -17,3 +17,52 @@ It uses the Accessibility API and observers to be notified of when new UI elemen
 #### Possible future work:
 
 Figuring out how to inject code into the Notification Center to actually prevent unwanted notifications from ever opening in the first place, for those sufficiently brave, desperate, or foolish. (I'm at least two of the three.)
+
+
+## Fork Notes
+
+This fork updates Quiet You! to be more robust on macOS Sequoia by making the Accessibility tree walking and notification dismissal logic less dependent on the older Notification Center hierarchy.
+
+It has been tested on macOS Sequoia 15.7.3 against the recurring `Background Items Added` / `GoogleUpdater` notification.
+
+This fork also adds a fallback for local unsigned builds: if the standard `SMAppService` helper registration fails because the app is not signed with a suitable Apple certificate, the app can fall back to installing a per-user `launchctl` LaunchAgent so the helper still runs locally for testing.
+
+
+## Building Locally
+
+You do not need a paid Apple Developer account to build and run this app locally on your own Mac.
+
+What you do need:
+
+- Xcode installed at `/Applications/Xcode.app`
+- Accessibility permission for the helper app after launch
+
+Build from Terminal:
+
+```bash
+xcodebuild -project QuietYou.xcodeproj -scheme QuietYou -configuration Release \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+```
+
+The built app will be placed under Xcode's DerivedData folder, typically at:
+
+```text
+~/Library/Developer/Xcode/DerivedData/.../Build/Products/Release/QuietYou.app
+```
+
+If you want to run it from Xcode instead, open `QuietYou.xcodeproj`, select the `QuietYou` scheme, and run the app normally.
+
+
+## Running Locally
+
+1. Launch `QuietYou.app`
+2. Add one or more match strings such as `Background Items Added` or `GoogleUpdater`
+3. Enable the checkbox to start the helper
+4. If prompted, grant Accessibility access to the helper app
+
+For unsigned local builds, macOS may require you to use right-click `Open` the first time you launch the app.
+
+
+## Release Note
+
+You need to build this fork yourself because I do not have the Apple Developer account setup needed to produce a macOS app build for distribution.
